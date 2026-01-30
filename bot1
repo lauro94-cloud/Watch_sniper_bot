@@ -1,7 +1,8 @@
-git commit -m "Add bot1.js for GitHub Actions
-import { parseStringPromise } from "node bot1/index.js";
+import { parseStringPromise } from "xml2js";
 import fs from "fs";
+import path from "path";
 
+// --- ENV ---
 const EBAY_APP_ID = process.env.EBAY_APP_ID;
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -10,6 +11,7 @@ if (!EBAY_APP_ID) throw new Error("Missing EBAY_APP_ID");
 if (!TG_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 if (!TG_CHAT_ID) throw new Error("Missing TELEGRAM_CHAT_ID");
 
+// --- CONFIG ---
 const EBAY_SITES = [
   { id: "EBAY-IT", label: "IT" },
   { id: "EBAY-DE", label: "DE" },
@@ -42,16 +44,19 @@ const CONFIG = {
 const now = Date.now();
 const msDay = 24 * 60 * 60 * 1000;
 
+// Salva lo stato in root repo (così Actions lo committa facilmente)
+const STATE_PATH = path.join(process.cwd(), "state.json");
+
 function loadState() {
   try {
-    return JSON.parse(fs.readFileSync("state.json", "utf8"));
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
   } catch {
     return { seen: {} };
   }
 }
 
 function saveState(state) {
-  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
 async function tgSend(messageText) {
@@ -76,7 +81,7 @@ async function tgSend(messageText) {
 }
 
 function escapeHtml(str) {
-  return String(str || "")
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
@@ -261,7 +266,7 @@ async function main() {
 
   await tgSend(
     `<b>🎯 Colpi trovati: ${picked.length}</b>\n` +
-      `Soglia: <code>${CONFIG.scoreThreshold}</code> — max: <code>${CONFIG.maxSend}</code>\n`
+    `Soglia: <code>${CONFIG.scoreThreshold}</code> — max: <code>${CONFIG.maxSend}</code>\n`
   );
 
   for (const it of picked) {
