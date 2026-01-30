@@ -1,0 +1,280 @@
+import { parseStringPromise } from "xml2js";
+import fs from "fs";
+
+const EBAY_APP_ID = process.env.EBAY_APP_ID;
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+if (!EBAY_APP_ID) throw new Error("Missing EBAY_APP_ID");
+if (!TG_TOKEN) throw new Error("Missing TELEGRAM_BOT_TOKEN");
+if (!TG_CHAT_ID) throw new Error("Missing TELEGRAM_CHAT_ID");
+
+const EBAY_SITES = [
+  { id: "EBAY-IT", label: "IT" },
+  { id: "EBAY-DE", label: "DE" },
+  { id: "EBAY-FR", label: "FR" },
+  { id: "EBAY-ES", label: "ES" },
+  { id: "EBAY-GB", label: "UK" },
+];
+
+const FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1";
+const CATEGORY_WRISTWATCHES = "31387";
+
+// =====================
+// CONFIG "CECCHINO"
+// =====================
+const CONFIG = {
+  keywords: "watch",
+  brand: "",               // es: "Seiko"
+  minPrice: null,          // es: 50
+  maxPrice: 300,           // es: 300
+  condition: "4000",       // Used
+  fixedPriceOnly: true,    // Buy It Now
+  banWords: ["replica", "homage", "clone", "fake"],
+  scoreThreshold: 70,
+  maxSend: 7,
+  perSiteResults: 30,
+  dedupDays: 10,
+};
+// =====================
+
+const now = Date.now();
+const msDay = 24 * 60 * 60 * 1000;
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync("state.json", "utf8"));
+  } catch {
+    return { seen: {} };
+  }
+}
+
+function saveState(state) {
+  fs.writeFileSync("state.json", JSON.stringify(state, null, 2));
+}
+
+async function tgSend(messageText) {
+  const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
+  const payload = {
+    chat_id: TG_CHAT_ID,
+    text: messageText,
+    disable_web_page_preview: true,
+    parse_mode: "HTML",
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Telegram sendMessage failed: ${res.status} ${t}`);
+  }
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function calcMedian(nums) {
+  const arr = nums
+    .filter((n) => typeof n === "number" && !Number.isNaN(n) && n > 0)
+    .sort((a, b) => a - b);
+  if (!arr.length) return null;
+  const mid = Math.floor(arr.length / 2);
+  return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+}
+
+function hasBannedWord(title) {
+  const t = (title || "").toLowerCase();
+  return (CONFIG.banWords || []).some((w) => w && t.includes(w));
+}
+
+function titleLooksShopLike(title) {
+  const t = (title || "").toLowerCase();
+  const bad = ["warranty", "authorized", "invoice", "fast shipping", "new stock", "dealer", "wholesale"];
+  return bad.some((w) => t.includes(w));
+}
+
+function titleLooksHuman(title) {
+  const t = (title || "").toLowerCase();
+  const good = ["non so", "trovato", "cassetto", "regalo", "vendo", "usato", "da sistemare", "works", "not working", "found"];
+  return good.some((w) => t.includes(w));
+}
+
+function scoreItem(item, medianPrice) {
+  let s = 50;
+
+  if (!item.itemId) return { score: 0, reason: ["invalid itemId"] };
+  if (!item.image) s -= 15;
+  if (hasBannedWord(item.title)) return { score: 0, reason: ["banned word"] };
+
+  if (item.storeInfo) s -= 30;
+  if (titleLooksShopLike(item.title)) s -= 15;
+
+  if (item.feedbackScore > 10000) s -= 20;
+  else if (item.feedbackScore > 2000) s -= 10;
+
+  if (titleLooksHuman(item.title)) s += 20;
+
+  if (item.shipping === 0) s += 5;
+  else if (item.shipping > 40) s -= 8;
+
+  if (medianPrice && item.price > 0) {
+    if (item.price < medianPrice * 0.60) s += 30;
+    else if (item.price < medianPrice * 0.75) s += 20;
+    else if (item.price > medianPrice * 1.40) s -= 10;
+  }
+
+  if (CONFIG.brand && item.title.toLowerCase().includes(CONFIG.brand.toLowerCase())) s += 5;
+
+  s = Math.max(0, Math.min(100, s));
+
+  const reasons = [];
+  if (item.storeInfo) reasons.push("- store");
+  if (titleLooksShopLike(item.title)) reasons.push("- shop-like");
+  if (item.feedbackScore > 2000) reasons.push("- high feedback");
+  if (titleLooksHuman(item.title)) reasons.push("+ human");
+  if (medianPrice && item.price < medianPrice * 0.75) reasons.push("+ below median");
+  if (item.shipping === 0) reasons.push("+ free ship");
+
+  return { score: s, reason: reasons.slice(0, 3) };
+}
+
+async function ebayFind(globalId) {
+  let searchKeywords = CONFIG.keywords || "watch";
+  if (CONFIG.brand) searchKeywords += ` ${CONFIG.brand}`;
+
+  const params = new URLSearchParams({
+    "OPERATION-NAME": "findItemsByKeywords",
+    "SERVICE-VERSION": "1.13.0",
+    "SECURITY-APPNAME": EBAY_APP_ID,
+    "RESPONSE-DATA-FORMAT": "XML",
+    "REST-PAYLOAD": "",
+    "GLOBAL-ID": globalId,
+    keywords: searchKeywords,
+    categoryId: CATEGORY_WRISTWATCHES,
+    "paginationInput.entriesPerPage": String(CONFIG.perSiteResults),
+    sortOrder: "StartTimeNewest",
+    "outputSelector(0)": "SellerInfo",
+    "outputSelector(1)": "PictureURLSuperSize",
+    "outputSelector(2)": "StoreInfo",
+  });
+
+  let idx = 0;
+  const addFilter = (name, value) => {
+    params.set(`itemFilter(${idx}).name`, name);
+    params.set(`itemFilter(${idx}).value`, String(value));
+    idx++;
+  };
+
+  if (CONFIG.minPrice != null) addFilter("MinPrice", CONFIG.minPrice);
+  if (CONFIG.maxPrice != null) addFilter("MaxPrice", CONFIG.maxPrice);
+  if (CONFIG.condition) addFilter("Condition", CONFIG.condition);
+  if (CONFIG.fixedPriceOnly) addFilter("ListingType", "FixedPrice");
+
+  const url = `${FINDING_URL}?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+
+  const xml = await res.text();
+  const json = await parseStringPromise(xml);
+
+  const resp = json?.findItemsByKeywordsResponse?.[0];
+  if (resp?.ack?.[0] !== "Success") return [];
+
+  const items = resp?.searchResult?.[0]?.item || [];
+
+  return items.map((it) => {
+    const price = parseFloat(it.sellingStatus?.[0]?.currentPrice?.[0]?._ ?? "0");
+    const currency = it.sellingStatus?.[0]?.currentPrice?.[0]?.$?.currencyId || "N/A";
+    const shipping = parseFloat(it.shippingInfo?.[0]?.shippingServiceCost?.[0]?._ ?? "0");
+    const storeInfo = it.storeInfo?.[0] || null;
+
+    return {
+      globalId,
+      title: it.title?.[0] || "N/A",
+      url: it.viewItemURL?.[0] || "",
+      itemId: it.itemId?.[0] || "",
+      price,
+      currency,
+      shipping,
+      condition: it.condition?.[0]?.conditionDisplayName?.[0] || "N/A",
+      location: it.location?.[0] || "N/A",
+      image: it.pictureURLSuperSize?.[0] || it.galleryURL?.[0] || "",
+      seller: it.sellerInfo?.[0]?.sellerUserName?.[0] || "N/A",
+      feedbackScore: parseInt(it.sellerInfo?.[0]?.feedbackScore?.[0] || "0", 10),
+      feedbackPct: parseFloat(it.sellerInfo?.[0]?.positiveFeedbackPercent?.[0] || "0"),
+      storeInfo,
+      startTime: it.listingInfo?.[0]?.startTime?.[0] || "",
+    };
+  });
+}
+
+async function main() {
+  const state = loadState();
+  state.seen ||= {};
+
+  // purge dedup
+  for (const [itemId, ts] of Object.entries(state.seen)) {
+    if (now - ts > CONFIG.dedupDays * msDay) delete state.seen[itemId];
+  }
+
+  const scoredAll = [];
+
+  for (const site of EBAY_SITES) {
+    const items = await ebayFind(site.id);
+    const median = calcMedian(items.map((i) => i.price));
+
+    for (const it of items) {
+      if (!it.itemId) continue;
+      if (state.seen[it.itemId]) continue;
+
+      const { score, reason } = scoreItem(it, median);
+      if (score <= 0) continue;
+
+      scoredAll.push({ ...it, siteLabel: site.label, score, reason });
+    }
+  }
+
+  scoredAll.sort((a, b) => (b.score - a.score) || String(b.startTime).localeCompare(String(a.startTime)));
+
+  const picked = scoredAll
+    .filter((x) => x.score >= CONFIG.scoreThreshold)
+    .slice(0, CONFIG.maxSend);
+
+  if (!picked.length) {
+    console.log("No picks above threshold");
+    saveState(state);
+    return;
+  }
+
+  // mark seen + save
+  for (const it of picked) state.seen[it.itemId] = now;
+  saveState(state);
+
+  await tgSend(
+    `<b>🎯 Colpi trovati: ${picked.length}</b>\n` +
+      `Soglia: <code>${CONFIG.scoreThreshold}</code> — max: <code>${CONFIG.maxSend}</code>\n`
+  );
+
+  for (const it of picked) {
+    const reasons = (it.reason || []).join(" ");
+    const line =
+      `<b>${escapeHtml(it.title).slice(0, 90)}</b>\n` +
+      `💰 <code>${it.price} ${it.currency}</code> + ship <code>${it.shipping} ${it.currency}</code> — <code>${escapeHtml(it.condition)}</code>\n` +
+      `📍 ${escapeHtml(it.location)} — 🌍 <b>${it.siteLabel}</b>\n` +
+      `👤 ${escapeHtml(it.seller)} (fb: ${it.feedbackScore}, ${it.feedbackPct}%)\n` +
+      `🎯 Score: <b>${it.score}</b> ${reasons ? `— <i>${escapeHtml(reasons)}</i>` : ""}\n` +
+      `🔗 ${it.url}`;
+
+    await tgSend(line);
+  }
+}
+
+await main();
