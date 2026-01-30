@@ -1,4 +1,4 @@
-import { parseStringPromise } from "xml2js";
+import { parseStringPromise } from "node bot1/index.js";
 import fs from "fs";
 
 const EBAY_APP_ID = process.env.EBAY_APP_ID;
